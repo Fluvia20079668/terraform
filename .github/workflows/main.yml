@@ -9,7 +9,6 @@ env:
   AWS_REGION: eu-north-1
   IMAGE_REPO: my-simple-app
   ECR_REGISTRY: 332427206046.dkr.ecr.eu-north-1.amazonaws.com
-  EKS_CLUSTER: my-eks-cluster
   K8S_NAMESPACE: default
 
 jobs:
@@ -41,18 +40,25 @@ jobs:
         working-directory: terraform
         run: terraform apply -auto-approve
 
-      # 4️⃣ Ensure ECR repository exists
+      # 4️⃣ Get EKS cluster name from Terraform output
+      - name: Get EKS cluster name
+        id: eks
+        run: |
+          EKS_CLUSTER=$(terraform -chdir=terraform output -raw eks_cluster_name)
+          echo "EKS_CLUSTER=$EKS_CLUSTER" >> $GITHUB_ENV
+
+      # 5️⃣ Ensure ECR repository exists
       - name: Create ECR repository if not exists
         run: |
           aws ecr describe-repositories --repository-names ${{ env.IMAGE_REPO }} >/dev/null 2>&1 || \
           aws ecr create-repository --repository-name ${{ env.IMAGE_REPO }}
           echo "ECR repository ${{ env.IMAGE_REPO }} is ready."
 
-      # 5️⃣ Log in to Amazon ECR
+      # 6️⃣ Log in to Amazon ECR
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
-      # 6️⃣ Build Docker image
+      # 7️⃣ Build Docker image
       - name: Build Docker image
         run: |
           IMAGE_TAG=${{ github.sha }}
@@ -61,28 +67,38 @@ jobs:
           docker tag $IMAGE_URI ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:latest
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-      # 7️⃣ Push Docker image to ECR
+      # 8️⃣ Push Docker image to ECR
       - name: Push Docker image
         run: |
           docker push $IMAGE_URI
           docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:latest
 
-      # 8️⃣ Update kubeconfig for EKS
+      # 9️⃣ Update kubeconfig for EKS
       - name: Update kubeconfig
         run: |
           aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
 
-      # 9️⃣ Apply Kubernetes manifests (Deployment & Service)
-      - name: Deploy to EKS
+      # 🔟 Ensure namespace exists
+      - name: Ensure Kubernetes namespace exists
         run: |
-          kubectl apply -f kubernetes/deployment.yaml
-          kubectl apply -f kubernetes/service.yaml
+          kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
 
-      # 🔟 Verify pods
+      # 1️⃣1️⃣ Replace image in all Kubernetes manifests
+      - name: Replace image in Kubernetes manifests
+        run: |
+          for file in kubernetes/*.yaml; do
+            sed -i "s|REPLACE_WITH_IMAGE_URI|$IMAGE_URI|g" "$file"
+          done
+
+      # 1️⃣2️⃣ Apply Kubernetes manifests
+      - name: Deploy to EKS
+        run: kubectl apply -f kubernetes/
+
+      # 1️⃣3️⃣ Verify pods
       - name: Verify pods
         run: kubectl get pods -o wide -n ${{ env.K8S_NAMESPACE }}
 
-      # 1️⃣1️⃣ Get LoadBalancer URL
+      # 1️⃣4️⃣ Get LoadBalancer URL
       - name: Get LoadBalancer URL
         id: get-url
         run: |
@@ -90,12 +106,12 @@ jobs:
                 -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
           echo "url=http://$URL" >> $GITHUB_OUTPUT
 
-      # 1️⃣2️⃣ Show live application link
+      # 1️⃣5️⃣ Show live application link
       - name: Show live application link
         run: |
           echo "✅ Your app is live at:"
           echo "${{ steps.get-url.outputs.url }}"
 
-      # 1️⃣3️⃣ Cleanup Docker images
+      # 1️⃣6️⃣ Cleanup Docker images
       - name: Cleanup
         run: docker image prune -af
