@@ -40,12 +40,13 @@ jobs:
         working-directory: terraform
         run: terraform apply -auto-approve
 
-      # 4️⃣ Get EKS cluster name from Terraform output
+      # 4️⃣ Get EKS cluster name from Terraform output (cleaned for GitHub Actions)
       - name: Get EKS cluster name
         id: eks
         run: |
-          EKS_CLUSTER=$(terraform -chdir=terraform output -raw eks_cluster_name)
+          EKS_CLUSTER=$(terraform -chdir=terraform output -raw eks_cluster_name | tr -d '"\n')
           echo "EKS_CLUSTER=$EKS_CLUSTER" >> $GITHUB_ENV
+          echo "eks_cluster=$EKS_CLUSTER" >> $GITHUB_OUTPUT
 
       # 5️⃣ Ensure ECR repository exists
       - name: Create ECR repository if not exists
