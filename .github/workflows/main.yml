@@ -1,4 +1,4 @@
-name: Build, Deploy & Provision with Terraform
+name: Build, Terraform, and Deploy to ECR & EKS
 
 on:
   push:
@@ -12,11 +12,11 @@ env:
   K8S_NAMESPACE: default
 
 jobs:
-  build-deploy:
+  build-and-deploy:
     runs-on: ubuntu-latest
 
     steps:
-      # 1️⃣ Checkout code
+      # 1️⃣ Checkout source code
       - name: Checkout source code
         uses: actions/checkout@v4
 
@@ -28,10 +28,11 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # 3️⃣ Terraform Init & Apply
+      # 3️⃣ Setup Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
 
+      # 4️⃣ Terraform Init & Apply
       - name: Terraform Init
         working-directory: terraform
         run: terraform init
@@ -39,14 +40,6 @@ jobs:
       - name: Terraform Apply
         working-directory: terraform
         run: terraform apply -auto-approve
-
-      # 4️⃣ Get EKS cluster name from Terraform output (cleaned for GitHub Actions)
-      - name: Get EKS cluster name
-        id: eks
-        run: |
-          EKS_CLUSTER=$(terraform -chdir=terraform output -raw eks_cluster_name | tr -d '"\n')
-          echo "EKS_CLUSTER=$EKS_CLUSTER" >> $GITHUB_ENV
-          echo "eks_cluster=$EKS_CLUSTER" >> $GITHUB_OUTPUT
 
       # 5️⃣ Ensure ECR repository exists
       - name: Create ECR repository if not exists
@@ -58,42 +51,59 @@ jobs:
       # 6️⃣ Log in to Amazon ECR
       - name: Log in to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
+        id: login-ecr
 
-      # 7️⃣ Build Docker image
-      - name: Build Docker image
+      # 7️⃣ Build and push Docker image
+      - name: Build and push Docker image
         run: |
           IMAGE_TAG=${{ github.sha }}
-          IMAGE_URI=${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:$IMAGE_TAG
-          docker build -t $IMAGE_URI .
-          docker tag $IMAGE_URI ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:latest
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          IMAGE_URI="$ECR_REGISTRY/${{ env.IMAGE_REPO }}:$IMAGE_TAG"
+          echo "Building and pushing image: $IMAGE_URI"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            -t "$IMAGE_URI" \
+            --push .
           echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-      # 8️⃣ Push Docker image to ECR
-      - name: Push Docker image
-        run: |
-          docker push $IMAGE_URI
-          docker push ${{ env.ECR_REGISTRY }}/${{ env.IMAGE_REPO }}:latest
+      # 8️⃣ Set up kubectl
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.30.0'
 
-      # 9️⃣ Update kubeconfig for EKS
-      - name: Update kubeconfig
+      # 9️⃣ Configure kubeconfig for EKS
+      - name: Configure kubeconfig for EKS
         run: |
-          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER }} --region ${{ env.AWS_REGION }}
+          aws eks update-kubeconfig --name ${{ secrets.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+          kubectl get nodes
 
-      # 🔟 Ensure namespace exists
-      - name: Ensure Kubernetes namespace exists
+      # 🔟 Ensure Kubernetes deployment exists
+      - name: Create deployment if not exists
         run: |
-          kubectl create namespace ${{ env.K8S_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+          if ! kubectl get deployment ${{ env.IMAGE_REPO }} -n ${{ env.K8S_NAMESPACE }} >/dev/null 2>&1; then
+            echo "Deployment not found. Creating deployment..."
+            kubectl create deployment ${{ env.IMAGE_REPO }} \
+              --image=$IMAGE_URI -n ${{ env.K8S_NAMESPACE }}
+          fi
 
-      # 1️⃣1️⃣ Replace image in all Kubernetes manifests
-      - name: Replace image in Kubernetes manifests
+      # 1️⃣1️⃣ Ensure service exists
+      - name: Create service if not exists
         run: |
-          for file in kubernetes/*.yaml; do
-            sed -i "s|REPLACE_WITH_IMAGE_URI|$IMAGE_URI|g" "$file"
-          done
+          if ! kubectl get svc ${{ env.IMAGE_REPO }}-service -n ${{ env.K8S_NAMESPACE }} >/dev/null 2>&1; then
+            echo "Service not found. Creating LoadBalancer service..."
+            kubectl expose deployment ${{ env.IMAGE_REPO }} \
+              --type=LoadBalancer --name=${{ env.IMAGE_REPO }}-service -n ${{ env.K8S_NAMESPACE }}
+          fi
 
-      # 1️⃣2️⃣ Apply Kubernetes manifests
+      # 1️⃣2️⃣ Update deployment with new image
       - name: Deploy to EKS
-        run: kubectl apply -f kubernetes/
+        run: |
+          echo "Updating deployment with image: $IMAGE_URI"
+          kubectl set image deployment/${{ env.IMAGE_REPO }} \
+            ${{ env.IMAGE_REPO }}=$IMAGE_URI -n ${{ env.K8S_NAMESPACE }}
+          echo "Waiting for rollout..."
+          kubectl rollout status deployment/${{ env.IMAGE_REPO }} -n ${{ env.K8S_NAMESPACE }}
 
       # 1️⃣3️⃣ Verify pods
       - name: Verify pods
@@ -105,6 +115,7 @@ jobs:
         run: |
           URL=$(kubectl get svc ${{ env.IMAGE_REPO }}-service -n ${{ env.K8S_NAMESPACE }} \
                 -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+          echo "Live URL: http://$URL"
           echo "url=http://$URL" >> $GITHUB_OUTPUT
 
       # 1️⃣5️⃣ Show live application link
